@@ -1,0 +1,131 @@
+// Each #kernel tells which function to compile, debug symbols are enabled
+#pragma kernel CSMain
+#pragma enable_d3d11_debug_symbols
+
+// Structure for incoming data of an agent
+struct data {
+  float3 pos;
+  float3 target;
+  float3 vel;
+  float desspeed;
+  int group;
+  float3 closestWall;
+};
+
+// Around max float value, big enough for our use
+float FLT_MAX = 3.4e38f;
+
+// Structure for returning result from computeshader
+struct result {
+  float3 force;
+  float3 wallf;
+  float walld;
+  float3 goalf;
+};
+// Hyper parameters for crowd, set in GPUDispatcher
+int numpeeps;
+float deltat;
+float relaxation;
+float repelspeed;
+float repeldistance;
+float influencedist;
+
+// Read write buffers for input and output, passed by GPUDispatcher
+RWStructuredBuffer<data> input;
+RWStructuredBuffer<result> output;
+
+// Every workgroup contains 10 threads
+[numthreads(10,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+  // Current thread number = workgroup number+thread idx
+  uint arrayidx = id.x;
+  // Don't process anything if the current idx is greater than array length
+  if (arrayidx > (uint) numpeeps) {
+    return;
+  }
+  
+  // Get data and initialize result for current agent
+  data d = input[arrayidx];
+  result f;
+
+  // driving force
+  float3 drivingForce = d.target - d.pos;
+  drivingForce = (normalize(drivingForce) * d.desspeed - d.vel) / relaxation;
+  f.force = drivingForce;
+  f.goalf = drivingForce;
+
+  // Repulsive and attractive acting on current agent
+  for (int i = 0; i < numpeeps; i++) {
+    // Don't calculate force for yourself
+    if (i == (int) arrayidx) {
+      continue;
+    }
+    // Get current agent from input and calculate distance vector and magnitude
+    data cur = input[i];
+    float3 distance = cur.pos - d.pos;
+    
+    if (length(distance) < 0.000001) {
+      distance = float3(0,0,0);
+    } else {
+      distance = distance;
+    }
+
+    // If agent is out of FOV don't consider
+    float distmag = length(distance);
+    if (distmag > influencedist) {
+      continue;
+    }
+
+    // Calculate driving force of other agent, calculate b (defined in SFM paper).
+    float3 curdrivingf = cur.target - cur.pos;
+    curdrivingf = (normalize(curdrivingf) * cur.desspeed - cur.vel) / relaxation;
+    float b = sqrt(clamp(pow(distmag + length(distance - length(cur.vel)*deltat*curdrivingf), 2) - pow(length(cur.vel)*deltat, 2), 0.0, FLT_MAX)) /2;
+    float3 exertedforce;
+    
+    // if exerted force is (0, 0, 0) normalize will return NaN, avoid this
+    if (length(distance) < 0.000001) {
+      exertedforce = float3(0,0,0);
+    } else {
+      exertedforce = normalize(distance);
+    }
+
+    // Add force depending on the group of the other agent, group 0 will always be repulsive, otherwise
+    // the same group indicates friends so attractive. If not always repulsive or friends, it's repulsive
+    if (d.group == 0) {
+      exertedforce *= -repelspeed*exp(-b/repeldistance);
+    } else if (d.group == cur.group) {
+      exertedforce *= repelspeed*exp(-b/repeldistance)- repelspeed + 1;
+    } else {
+      exertedforce *= -repelspeed*exp(-b/repeldistance);
+    }
+
+    // Change magnitude of force depending on if the person exhibiting it is within view angle
+    float anglemultiplier = 1;
+    if (dot(drivingForce, exertedforce) >= length(exertedforce) * cos(100)) {
+      anglemultiplier = 0.5;
+    }
+
+    f.force += anglemultiplier * exertedforce;
+  }
+
+  // Wall repulsion
+  d.closestWall = d.closestWall * float3(1,0,1); // ignore height component
+  float wallDistance = length(d.closestWall - d.pos);
+  f.walld = wallDistance;
+  float3 wallForce;
+
+  // Same normalize trick as before
+  if (wallDistance == 0) {
+    wallForce = float3(0, 0, 0);
+  } else {
+    wallForce = normalize(d.closestWall - d.pos);
+  }
+  float scalar_exponent = -(wallDistance/0.3);
+  float scalar = -10 * exp(scalar_exponent);
+  f.force += wallForce*scalar;
+  f.wallf = wallForce*scalar;
+
+  // object force
+  output[arrayidx] = f;
+}
